@@ -10,7 +10,12 @@ use bevy::{
     },
 };
 use bevy_editor_cam::{prelude::EditorCam, DefaultEditorCamPlugins};
-use bevy_mod_picking::{debug::DebugPickingMode, DefaultPickingPlugins};
+use bevy_mod_picking::{
+    debug::DebugPickingMode,
+    events::{Move, Out, Pointer},
+    prelude::{ListenerInput, On},
+    DefaultPickingPlugins,
+};
 use egui_suppress::EguiSupressPlugin;
 use gizmos::GizmosPlugin;
 use material_mesh_cache::{MaterialMeshCachePlugin, MeshMaterialCache};
@@ -68,6 +73,8 @@ fn main() {
             Update,
             (animate_light_direction, propagate_follower_transforms),
         )
+        .add_event::<MoveOverFirstPlaneEvent>()
+        .add_event::<MoveOutFirstPlaneEvent>()
         .run();
 }
 
@@ -87,6 +94,9 @@ impl Default for ImageSize {
 
 #[derive(Debug, Component)]
 struct MainCamera;
+
+#[derive(Debug, Component)]
+struct SecondaryCamera;
 
 fn setup(
     mut commands: Commands,
@@ -175,6 +185,7 @@ fn setup(
             scale: true,
             rotation: true,
         },
+        SecondaryCamera,
     ));
 }
 
@@ -256,6 +267,9 @@ struct ImagePlanes {
 #[derive(Debug, Component)]
 struct ImagePlane;
 
+#[derive(Debug, Component)]
+struct MainImagePlane;
+
 impl Default for ImagePlanes {
     fn default() -> Self {
         Self { num_planes: 7 }
@@ -269,55 +283,76 @@ struct MainPointsCommands<'w, 's> {
 }
 
 impl<'w, 's> MainPointsCommands<'w, 's> {
-    fn spawn(&mut self, bundle: impl Bundle) {
+    fn child_builder(&mut self, child_builder_fn: impl FnOnce(&mut ChildBuilder)) {
         self.commands
             .entity(**self.parent)
-            .with_children(|child_builder| {
-                child_builder.spawn(bundle);
-            });
+            .with_children(child_builder_fn);
+    }
+}
+
+#[derive(Event, Debug, Deref)]
+struct MoveOverFirstPlaneEvent {
+    data: Pointer<Move>,
+}
+
+impl From<ListenerInput<Pointer<Move>>> for MoveOverFirstPlaneEvent {
+    fn from(event: ListenerInput<Pointer<Move>>) -> Self {
+        Self {
+            data: (*event).clone(),
+        }
+    }
+}
+
+#[derive(Event, Debug, Deref)]
+struct MoveOutFirstPlaneEvent {
+    data: Pointer<Out>,
+}
+
+impl From<ListenerInput<Pointer<Out>>> for MoveOutFirstPlaneEvent {
+    fn from(event: ListenerInput<Pointer<Out>>) -> Self {
+        Self {
+            data: (*event).clone(),
+        }
     }
 }
 
 fn image_planes(
     mut commands: MainPointsCommands,
-    mut rect: Local<Option<Handle<Mesh>>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut mat: Local<Option<Handle<StandardMaterial>>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut cache: MeshMaterialCache,
     size: Res<ImageSize>,
     planes: Res<ImagePlanes>,
 ) {
-    let mesh = rect
-        .get_or_insert_with(|| meshes.add(Plane3d::default().mesh()))
-        .clone_weak();
-    let material = mat
-        .get_or_insert_with(|| {
-            let mut smat: StandardMaterial =
-                Color::from(palettes::tailwind::GREEN_300.with_alpha(0.05)).into();
-
-            smat.unlit = true;
-            smat.cull_mode = None;
-            materials.add(smat)
-        })
-        .clone_weak();
-
     for i in 1..=planes.num_planes {
         let i_f32 = i as f32;
 
-        commands.spawn((
-            MaterialMeshBundle {
-                mesh: mesh.clone_weak(),
-                material: material.clone_weak(),
-                transform: Transform::from_translation(Vec3::Z * i_f32)
-                    // Plane has normal +Y, so size is defined in terms of XZ.
-                    .with_scale(Vec3::new(size.x * i_f32, 0.01, size.y * i_f32))
-                    // We then also have to rotate 90 deg in X to have a plane in XY.
-                    .with_rotation(Quat::from_axis_angle(Vec3::X, -std::f32::consts::FRAC_PI_2)),
-                ..default()
-            },
-            ImagePlane,
-            Name::new(format!("plane-{i}")),
-        ));
+        commands.child_builder(|b| {
+            let mut cmds = b.spawn((
+                MaterialMeshBundle {
+                    mesh: cache.mesh::<Plane3d>(),
+                    material: cache
+                        .material(palettes::tailwind::GREEN_300.with_alpha(0.05).to_u8_array()),
+                    transform: Transform::from_translation(Vec3::Z * i_f32)
+                        // Plane has normal +Y, so size is defined in terms of XZ.
+                        .with_scale(Vec3::new(size.x * i_f32, 0.01, size.y * i_f32))
+                        // We then also have to rotate 90 deg in X to have a plane in XY.
+                        .with_rotation(Quat::from_axis_angle(
+                            Vec3::X,
+                            -std::f32::consts::FRAC_PI_2,
+                        )),
+                    ..default()
+                },
+                ImagePlane,
+                Name::new(format!("plane-{i}")),
+            ));
+
+            if i == 1 {
+                cmds.insert((
+                    On::<Pointer<Move>>::send_event::<MoveOverFirstPlaneEvent>(),
+                    On::<Pointer<Out>>::send_event::<MoveOutFirstPlaneEvent>(),
+                    MainImagePlane,
+                ));
+            }
+        });
     }
 }
 
@@ -360,18 +395,20 @@ fn generate_points(
     for index in 0..points.num_points {
         let pos = rect.sample_interior(&mut rand::thread_rng());
 
-        commands.spawn((
-            MaterialMeshBundle {
-                mesh: cache.mesh::<Sphere>(),
-                material: cache.material(index),
-                transform: Transform::from_translation(pos.extend(1.0))
-                    .with_scale(Vec3::splat(points.point_size)),
-                ..default()
-            },
-            ImagePoint,
-            ImagePointIndex { index },
-            Name::new(format!("point-{index}")),
-        ));
+        commands.child_builder(|b| {
+            b.spawn((
+                MaterialMeshBundle {
+                    mesh: cache.mesh::<Sphere>(),
+                    material: cache.material(index),
+                    transform: Transform::from_translation(pos.extend(1.0))
+                        .with_scale(Vec3::splat(points.point_size)),
+                    ..default()
+                },
+                ImagePoint,
+                ImagePointIndex { index },
+                Name::new(format!("point-{index}")),
+            ));
+        });
     }
 }
 
@@ -389,20 +426,23 @@ fn generate_sub_points(
             let z = plane_index as f32;
             let translation = transform.translation * z;
 
-            commands.spawn((
-                MaterialMeshBundle {
-                    mesh: cache.mesh::<Sphere>(),
-                    material: cache.material(image_point_index.index),
-                    transform: Transform::from_translation(translation).with_scale(transform.scale),
-                    ..default()
-                },
-                SubImagePoint,
-                *image_point_index,
-                Name::new(format!(
-                    "sub-point {plane_index}-{}",
-                    image_point_index.index
-                )),
-            ));
+            commands.child_builder(|b| {
+                b.spawn((
+                    MaterialMeshBundle {
+                        mesh: cache.mesh::<Sphere>(),
+                        material: cache.material(image_point_index.index),
+                        transform: Transform::from_translation(translation)
+                            .with_scale(transform.scale),
+                        ..default()
+                    },
+                    SubImagePoint,
+                    *image_point_index,
+                    Name::new(format!(
+                        "sub-point {plane_index}-{}",
+                        image_point_index.index
+                    )),
+                ));
+            });
         }
     }
 }
