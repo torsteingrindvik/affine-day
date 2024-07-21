@@ -1,6 +1,7 @@
 use bevy::{
     color::palettes,
     core_pipeline::Skybox,
+    ecs::system::SystemParam,
     pbr::CascadeShadowConfigBuilder,
     prelude::*,
     render::texture::{ImageLoaderSettings, ImageSampler},
@@ -9,7 +10,10 @@ use bevy::{
 use bevy_editor_cam::{prelude::EditorCam, DefaultEditorCamPlugins};
 use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bevy_mod_picking::{debug::DebugPickingMode, DefaultPickingPlugins};
-use std::f32::consts::{FRAC_PI_4, PI};
+use std::{
+    any::TypeId,
+    f32::consts::{FRAC_PI_4, PI},
+};
 
 fn should_remake(point: Res<ImagePoints>, planes: Res<ImagePlanes>, size: Res<ImageSize>) -> bool {
     point.is_changed() || planes.is_changed() || size.is_changed()
@@ -23,7 +27,11 @@ fn main() {
         .register_type::<ImagePoints>()
         .init_resource::<ImageSize>()
         .register_type::<ImageSize>()
-        .init_resource::<MaterialsCache>()
+        .register_type::<ImagePointIndex>()
+        .init_resource::<TypeIdMeshCache>()
+        .register_type::<TypeIdMeshCache>()
+        .init_resource::<UsizeMaterialCache>()
+        .register_type::<UsizeMaterialCache>()
         .add_plugins((
             DefaultPlugins,
             WorldInspectorPlugin::new(),
@@ -122,7 +130,7 @@ struct ImagePlane;
 
 impl Default for ImagePlanes {
     fn default() -> Self {
-        Self { num_planes: 3 }
+        Self { num_planes: 7 }
     }
 }
 
@@ -155,21 +163,21 @@ fn image_planes(
         .clone_weak();
 
     for i in 1..=planes.num_planes {
-        let i = i as f32;
+        let i_f32 = i as f32;
 
         commands.spawn((
             MaterialMeshBundle {
                 mesh: mesh.clone_weak(),
                 material: material.clone_weak(),
-                transform: Transform::from_translation(Vec3::Z * i)
+                transform: Transform::from_translation(Vec3::Z * i_f32)
                     // Plane has normal +Y, so size is defined in terms of XZ.
-                    .with_scale(Vec3::new(size.x * i, 0.01, size.y * i))
+                    .with_scale(Vec3::new(size.x * i_f32, 0.01, size.y * i_f32))
                     // We then also have to rotate 90 deg in X to have a plane in XY.
                     .with_rotation(Quat::from_axis_angle(Vec3::X, -std::f32::consts::FRAC_PI_2)),
                 ..default()
             },
             ImagePlane,
-            Name::new("plane"),
+            Name::new(format!("plane-{i}")),
         ));
     }
 }
@@ -184,14 +192,17 @@ struct ImagePoints {
 impl Default for ImagePoints {
     fn default() -> Self {
         Self {
-            num_points: 50,
-            point_size: 0.01,
+            num_points: 10,
+            point_size: 0.05,
         }
     }
 }
 
 #[derive(Debug, Component)]
-struct ImagePoint {
+struct ImagePoint;
+
+#[derive(Debug, Clone, Copy, Component, Reflect)]
+struct ImagePointIndex {
     index: usize,
 }
 
@@ -199,43 +210,56 @@ struct ImagePoint {
 #[derive(Debug, Component)]
 struct SubImagePoint;
 
-#[derive(Debug, Default, Resource)]
-struct MaterialsCache {
-    cache: HashMap<usize, Handle<StandardMaterial>>,
-    colors: HashMap<usize, Color>,
+#[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
+#[reflect(Resource)]
+struct TypeIdMeshCache {
+    cache: HashMap<TypeId, Handle<Mesh>>,
 }
-impl MaterialsCache {
-    fn get_or_make(
-        &mut self,
-        materials: &mut Assets<StandardMaterial>,
-        key: usize,
-    ) -> (Handle<StandardMaterial>, Color) {
-        if self.cache.contains_key(&key) {
-            (
-                self.cache.get(&key).unwrap().clone_weak(),
-                *self.colors.get(&key).unwrap(),
-            )
-        } else {
-            let color = Color::srgb_from_array(rand::random());
-            let mut smat: StandardMaterial = color.into();
 
-            smat.unlit = true;
-            smat.cull_mode = None;
-            let handle = materials.add(smat);
-            let weak_handle = handle.clone_weak();
-            self.cache.insert(key, handle);
-            self.colors.insert(key, color);
-            (weak_handle, color)
-        }
+#[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
+#[reflect(Resource)]
+struct UsizeMaterialCache {
+    cache: HashMap<usize, Handle<StandardMaterial>>,
+}
+
+#[derive(SystemParam)]
+struct MeshMaterialCache<'w> {
+    mesh_assets: ResMut<'w, Assets<Mesh>>,
+    mesh_cache: ResMut<'w, TypeIdMeshCache>,
+
+    material_assets: ResMut<'w, Assets<StandardMaterial>>,
+    material_cache: ResMut<'w, UsizeMaterialCache>,
+}
+
+impl<'w> MeshMaterialCache<'_> {
+    /// Weak handle to a default mesh of given type
+    fn mesh<M: Meshable + Default + 'static>(&mut self) -> Handle<Mesh> {
+        self.mesh_cache
+            .entry(std::any::TypeId::of::<M>())
+            .or_insert_with(|| self.mesh_assets.add(M::default().mesh()))
+            .clone_weak()
+    }
+
+    /// Weak handle to a material from a usize.
+    /// Material is unlit and of random color.
+    fn material(&mut self, key: usize) -> Handle<StandardMaterial> {
+        self.material_cache
+            .entry(key)
+            .or_insert_with(|| {
+                let color = Color::srgb_from_array(rand::random());
+                let mut smat: StandardMaterial = color.into();
+
+                smat.unlit = true;
+                smat.cull_mode = None;
+                self.material_assets.add(smat)
+            })
+            .clone_weak()
     }
 }
 
 fn generate_points(
     mut commands: Commands,
-    mut rect: Local<Option<Handle<Mesh>>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut materials_cache: ResMut<MaterialsCache>,
+    mut cache: MeshMaterialCache,
     size: Res<ImageSize>,
     points: Res<ImagePoints>,
     existing_points: Query<Entity, With<ImagePoint>>,
@@ -244,38 +268,31 @@ fn generate_points(
         commands.entity(entity).despawn_recursive();
     }
 
-    let mesh = rect
-        .get_or_insert_with(|| meshes.add(Sphere::default().mesh()))
-        .clone_weak();
-
     let rect = Rectangle::new(size.x, size.y);
 
     for index in 0..points.num_points {
         let pos = rect.sample_interior(&mut rand::thread_rng());
-        let (material, _) = materials_cache.get_or_make(&mut materials, index);
 
         commands.spawn((
             MaterialMeshBundle {
-                mesh: mesh.clone_weak(),
-                material,
+                mesh: cache.mesh::<Sphere>(),
+                material: cache.material(index),
                 transform: Transform::from_translation(pos.extend(1.0))
                     .with_scale(Vec3::splat(points.point_size)),
                 ..default()
             },
-            ImagePoint { index },
-            Name::new("point"),
+            ImagePoint,
+            ImagePointIndex { index },
+            Name::new(format!("point-{index}")),
         ));
     }
 }
 
 fn generate_sub_points(
     mut commands: Commands,
-    mut rect: Local<Option<Handle<Mesh>>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut materials_cache: ResMut<MaterialsCache>,
+    mut cache: MeshMaterialCache,
     planes: Res<ImagePlanes>,
-    points: Query<(&ImagePoint, &Transform)>,
+    points: Query<(&ImagePointIndex, &Transform), With<ImagePoint>>,
     sub_points: Query<Entity, With<SubImagePoint>>,
 ) {
     for entity in &sub_points {
@@ -285,29 +302,24 @@ fn generate_sub_points(
     if planes.num_planes < 2 {
         return;
     }
-
-    let mesh: Handle<Mesh> = rect
-        .get_or_insert_with(|| meshes.add(Sphere::default().mesh()))
-        .clone_weak();
-
-    // let rect = Rectangle::new(size.x, size.y);
-
-    for (image_point, transform) in &points {
-        let (material, _) = materials_cache.get_or_make(&mut materials, image_point.index);
-
+    for (image_point_index, transform) in &points {
         for plane_index in 2..=planes.num_planes {
             let z = plane_index as f32;
             let translation = transform.translation * z;
 
             commands.spawn((
                 MaterialMeshBundle {
-                    mesh: mesh.clone_weak(),
-                    material: material.clone_weak(),
+                    mesh: cache.mesh::<Sphere>(),
+                    material: cache.material(image_point_index.index),
                     transform: Transform::from_translation(translation).with_scale(transform.scale),
                     ..default()
                 },
                 SubImagePoint,
-                Name::new("sub-point"),
+                *image_point_index,
+                Name::new(format!(
+                    "sub-point {plane_index}-{}",
+                    image_point_index.index
+                )),
             ));
         }
     }
