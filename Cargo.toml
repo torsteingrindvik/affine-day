@@ -20,3 +20,4 @@ bevy_mod_picking = { version = "0.20.1", features = ["backend_egui"] }
 rand = "0.8.5"
 serde = { version = "1.0.204", features = ["derive"] }
 thiserror = "1.0.63"
+transform-gizmo-bevy = "0.3.0"

@@ -1,15 +1,21 @@
 use bevy::{
     color::palettes,
     core_pipeline::Skybox,
+    ecs::system::SystemParam,
     pbr::CascadeShadowConfigBuilder,
     prelude::*,
-    render::texture::{ImageLoaderSettings, ImageSampler},
+    render::{
+        texture::{ImageLoaderSettings, ImageSampler},
+        view::RenderLayers,
+    },
 };
 use bevy_editor_cam::{prelude::EditorCam, DefaultEditorCamPlugins};
 use bevy_mod_picking::{debug::DebugPickingMode, DefaultPickingPlugins};
+use egui_suppress::EguiSupressPlugin;
 use gizmos::GizmosPlugin;
 use material_mesh_cache::{MaterialMeshCachePlugin, MeshMaterialCache};
 use std::f32::consts::{FRAC_PI_4, PI};
+use transform_gizmo_bevy::{GizmoCamera, GizmoTarget, TransformGizmoPlugin};
 use ui_settings::UiSettingsPlugin;
 use viewport_camera::ViewportCameraPlugin;
 
@@ -18,12 +24,15 @@ fn should_remake(point: Res<ImagePoints>, planes: Res<ImagePlanes>, size: Res<Im
 }
 
 // Potentially re-usable stuff
+pub mod egui_suppress;
 pub mod gizmos;
 pub mod material_mesh_cache;
 pub mod viewport_camera;
 
 // Very this-project specific stuff
 pub mod ui_settings;
+
+const MISC_LAYER: usize = 1;
 
 fn main() {
     App::new()
@@ -38,21 +47,32 @@ fn main() {
             DefaultPlugins,
             DefaultPickingPlugins,
             DefaultEditorCamPlugins,
+            TransformGizmoPlugin,
         ))
         .add_plugins((
             MaterialMeshCachePlugin,
             ViewportCameraPlugin,
             GizmosPlugin,
             UiSettingsPlugin,
+            EguiSupressPlugin,
         ))
         .insert_resource(DebugPickingMode::Normal)
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (setup_parent_spatial, setup).chain())
         .add_systems(
             Update,
-            (image_planes, (generate_points, generate_sub_points).chain()).run_if(should_remake),
+            (clear, image_planes, generate_points, generate_sub_points)
+                .chain()
+                .run_if(should_remake),
         )
-        .add_systems(Update, animate_light_direction)
+        .add_systems(
+            Update,
+            (animate_light_direction, propagate_follower_transforms),
+        )
         .run();
+}
+
+fn clear(mut commands: Commands, parent: Res<MainPointsParent>) {
+    commands.entity(**parent).despawn_descendants();
 }
 
 #[derive(Debug, Resource, Deref, DerefMut, Reflect)]
@@ -68,7 +88,11 @@ impl Default for ImageSize {
 #[derive(Debug, Component)]
 struct MainCamera;
 
-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn setup(
+    mut commands: Commands,
+    main_points_entity: Res<MainPointsParent>,
+    asset_server: Res<AssetServer>,
+) {
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
             shadows_enabled: true,
@@ -97,6 +121,8 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             ..default()
         },
         EditorCam::default(),
+        RenderLayers::default().with(MISC_LAYER),
+        GizmoCamera,
         Skybox {
             image: asset_server.load_with_settings::<Image, ImageLoaderSettings>(
                 format!("skyboxes/circus_arena_4k_diffuse.ktx2"),
@@ -142,7 +168,69 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
             anchor: viewport_camera::Anchor::BottomRight,
             fraction: Vec2::new(0.3, 0.3),
         },
+        // For some reason if we spawn this camera as a child we get issues, so let's do this instead
+        CopyTransformOf {
+            target: **main_points_entity,
+            translation: true,
+            scale: true,
+            rotation: true,
+        },
     ));
+}
+
+#[derive(Debug, Component)]
+struct CopyTransformOf {
+    target: Entity,
+    translation: bool,
+    scale: bool,
+    rotation: bool,
+}
+
+fn propagate_follower_transforms(
+    mut followers: Query<(&mut Transform, &CopyTransformOf)>,
+    targets: Query<&Transform, Without<CopyTransformOf>>,
+) {
+    for (
+        mut transform,
+        CopyTransformOf {
+            target,
+            translation,
+            scale,
+            rotation,
+        },
+    ) in &mut followers
+    {
+        let Ok(target) = targets.get(*target) else {
+            warn!("unexpected target missing");
+            continue;
+        };
+
+        if *translation {
+            transform.translation = target.translation;
+        }
+        if *scale {
+            transform.scale = target.scale;
+        }
+        if *rotation {
+            // transform.rotation = target.rotation;
+        }
+    }
+}
+
+#[derive(Debug, Resource, Deref)]
+struct MainPointsParent {
+    entity: Entity,
+}
+
+fn setup_parent_spatial(mut commands: Commands) {
+    let id = commands
+        .spawn((
+            SpatialBundle::INHERITED_IDENTITY,
+            Name::new(format!("main points parent")),
+            GizmoTarget::default(),
+        ))
+        .id();
+    commands.insert_resource(MainPointsParent { entity: id });
 }
 
 fn animate_light_direction(
@@ -174,20 +262,31 @@ impl Default for ImagePlanes {
     }
 }
 
+#[derive(SystemParam)]
+struct MainPointsCommands<'w, 's> {
+    commands: Commands<'w, 's>,
+    parent: Res<'w, MainPointsParent>,
+}
+
+impl<'w, 's> MainPointsCommands<'w, 's> {
+    fn spawn(&mut self, bundle: impl Bundle) {
+        self.commands
+            .entity(**self.parent)
+            .with_children(|child_builder| {
+                child_builder.spawn(bundle);
+            });
+    }
+}
+
 fn image_planes(
-    mut commands: Commands,
+    mut commands: MainPointsCommands,
     mut rect: Local<Option<Handle<Mesh>>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut mat: Local<Option<Handle<StandardMaterial>>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     size: Res<ImageSize>,
     planes: Res<ImagePlanes>,
-    existing_planes: Query<Entity, With<ImagePlane>>,
 ) {
-    for entity in &existing_planes {
-        commands.entity(entity).despawn_recursive();
-    }
-
     let mesh = rect
         .get_or_insert_with(|| meshes.add(Plane3d::default().mesh()))
         .clone_weak();
@@ -251,16 +350,11 @@ struct ImagePointIndex {
 struct SubImagePoint;
 
 fn generate_points(
-    mut commands: Commands,
+    mut commands: MainPointsCommands,
     mut cache: MeshMaterialCache,
     size: Res<ImageSize>,
     points: Res<ImagePoints>,
-    existing_points: Query<Entity, With<ImagePoint>>,
 ) {
-    for entity in &existing_points {
-        commands.entity(entity).despawn_recursive();
-    }
-
     let rect = Rectangle::new(size.x, size.y);
 
     for index in 0..points.num_points {
@@ -282,16 +376,11 @@ fn generate_points(
 }
 
 fn generate_sub_points(
-    mut commands: Commands,
+    mut commands: MainPointsCommands,
     mut cache: MeshMaterialCache,
     planes: Res<ImagePlanes>,
     points: Query<(&ImagePointIndex, &Transform), With<ImagePoint>>,
-    sub_points: Query<Entity, With<SubImagePoint>>,
 ) {
-    for entity in &sub_points {
-        commands.entity(entity).despawn_recursive();
-    }
-
     if planes.num_planes < 2 {
         return;
     }
