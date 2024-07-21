@@ -1,23 +1,29 @@
 use bevy::{
     color::palettes,
     core_pipeline::Skybox,
-    ecs::system::SystemParam,
     pbr::CascadeShadowConfigBuilder,
     prelude::*,
     render::texture::{ImageLoaderSettings, ImageSampler},
-    utils::HashMap,
 };
 use bevy_editor_cam::{prelude::EditorCam, DefaultEditorCamPlugins};
-use bevy_inspector_egui::quick::WorldInspectorPlugin;
 use bevy_mod_picking::{debug::DebugPickingMode, DefaultPickingPlugins};
-use std::{
-    any::TypeId,
-    f32::consts::{FRAC_PI_4, PI},
-};
+use gizmos::GizmosPlugin;
+use material_mesh_cache::{MaterialMeshCachePlugin, MeshMaterialCache};
+use std::f32::consts::{FRAC_PI_4, PI};
+use ui_settings::UiSettingsPlugin;
+use viewport_camera::ViewportCameraPlugin;
 
 fn should_remake(point: Res<ImagePoints>, planes: Res<ImagePlanes>, size: Res<ImageSize>) -> bool {
     point.is_changed() || planes.is_changed() || size.is_changed()
 }
+
+// Potentially re-usable stuff
+pub mod gizmos;
+pub mod material_mesh_cache;
+pub mod viewport_camera;
+
+// Very this-project specific stuff
+pub mod ui_settings;
 
 fn main() {
     App::new()
@@ -28,15 +34,16 @@ fn main() {
         .init_resource::<ImageSize>()
         .register_type::<ImageSize>()
         .register_type::<ImagePointIndex>()
-        .init_resource::<TypeIdMeshCache>()
-        .register_type::<TypeIdMeshCache>()
-        .init_resource::<UsizeMaterialCache>()
-        .register_type::<UsizeMaterialCache>()
         .add_plugins((
             DefaultPlugins,
-            WorldInspectorPlugin::new(),
             DefaultPickingPlugins,
             DefaultEditorCamPlugins,
+        ))
+        .add_plugins((
+            MaterialMeshCachePlugin,
+            ViewportCameraPlugin,
+            GizmosPlugin,
+            UiSettingsPlugin,
         ))
         .insert_resource(DebugPickingMode::Normal)
         .add_systems(Startup, setup)
@@ -44,7 +51,6 @@ fn main() {
             Update,
             (image_planes, (generate_points, generate_sub_points).chain()).run_if(should_remake),
         )
-        .add_systems(Update, gizmo_world_axes)
         .add_systems(Update, animate_light_direction)
         .run();
 }
@@ -55,33 +61,14 @@ struct ImageSize(Vec2);
 
 impl Default for ImageSize {
     fn default() -> Self {
-        Self(Vec2::new(2.0, 2.0))
+        Self(Vec2::new(1.36, 0.765))
     }
 }
 
-fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
-    commands.spawn((
-        Camera3dBundle {
-            transform: Transform::default().looking_at(Vec3::Z, Vec3::Y),
-            ..default()
-        },
-        EditorCam::default(),
-        Skybox {
-            image: asset_server.load_with_settings::<Image, ImageLoaderSettings>(
-                format!("skyboxes/circus_arena_4k_diffuse.ktx2"),
-                |settings| {
-                    settings.sampler = ImageSampler::linear();
-                },
-            ),
-            brightness: 1000.0,
-        },
-        EnvironmentMapLight {
-            diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
-            specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
-            intensity: 250.0,
-        },
-    ));
+#[derive(Debug, Component)]
+struct MainCamera;
 
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
             shadows_enabled: true,
@@ -99,6 +86,63 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         .into(),
         ..default()
     });
+
+    commands.spawn((
+        Camera3dBundle {
+            transform: Transform::default().looking_at(Vec3::Z, Vec3::Y),
+            camera: Camera {
+                order: 0,
+                ..default()
+            },
+            ..default()
+        },
+        EditorCam::default(),
+        Skybox {
+            image: asset_server.load_with_settings::<Image, ImageLoaderSettings>(
+                format!("skyboxes/circus_arena_4k_diffuse.ktx2"),
+                |settings| {
+                    settings.sampler = ImageSampler::linear();
+                },
+            ),
+            brightness: 1000.0,
+        },
+        EnvironmentMapLight {
+            diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
+            specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+            intensity: 250.0,
+        },
+        MainCamera,
+    ));
+
+    commands.spawn((
+        Camera3dBundle {
+            transform: Transform::default().looking_at(Vec3::Z, Vec3::Y),
+            camera: Camera {
+                clear_color: ClearColorConfig::None,
+                order: 1,
+                ..default()
+            },
+            ..default()
+        },
+        Skybox {
+            image: asset_server.load_with_settings::<Image, ImageLoaderSettings>(
+                format!("skyboxes/circus_arena_4k_diffuse.ktx2"),
+                |settings| {
+                    settings.sampler = ImageSampler::linear();
+                },
+            ),
+            brightness: 1000.0,
+        },
+        EnvironmentMapLight {
+            diffuse_map: asset_server.load("environment_maps/pisa_diffuse_rgb9e5_zstd.ktx2"),
+            specular_map: asset_server.load("environment_maps/pisa_specular_rgb9e5_zstd.ktx2"),
+            intensity: 250.0,
+        },
+        viewport_camera::ViewportCamera {
+            anchor: viewport_camera::Anchor::BottomRight,
+            fraction: Vec2::new(0.3, 0.3),
+        },
+    ));
 }
 
 fn animate_light_direction(
@@ -113,10 +157,6 @@ fn animate_light_direction(
             -FRAC_PI_4,
         );
     }
-}
-
-fn gizmo_world_axes(mut gizmos: Gizmos) {
-    gizmos.axes(Transform::default(), 1.0);
 }
 
 #[derive(Debug, Resource, Reflect)]
@@ -209,53 +249,6 @@ struct ImagePointIndex {
 /// For points in planes with Z > 1.0
 #[derive(Debug, Component)]
 struct SubImagePoint;
-
-#[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
-#[reflect(Resource)]
-struct TypeIdMeshCache {
-    cache: HashMap<TypeId, Handle<Mesh>>,
-}
-
-#[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
-#[reflect(Resource)]
-struct UsizeMaterialCache {
-    cache: HashMap<usize, Handle<StandardMaterial>>,
-}
-
-#[derive(SystemParam)]
-struct MeshMaterialCache<'w> {
-    mesh_assets: ResMut<'w, Assets<Mesh>>,
-    mesh_cache: ResMut<'w, TypeIdMeshCache>,
-
-    material_assets: ResMut<'w, Assets<StandardMaterial>>,
-    material_cache: ResMut<'w, UsizeMaterialCache>,
-}
-
-impl<'w> MeshMaterialCache<'_> {
-    /// Weak handle to a default mesh of given type
-    fn mesh<M: Meshable + Default + 'static>(&mut self) -> Handle<Mesh> {
-        self.mesh_cache
-            .entry(std::any::TypeId::of::<M>())
-            .or_insert_with(|| self.mesh_assets.add(M::default().mesh()))
-            .clone_weak()
-    }
-
-    /// Weak handle to a material from a usize.
-    /// Material is unlit and of random color.
-    fn material(&mut self, key: usize) -> Handle<StandardMaterial> {
-        self.material_cache
-            .entry(key)
-            .or_insert_with(|| {
-                let color = Color::srgb_from_array(rand::random());
-                let mut smat: StandardMaterial = color.into();
-
-                smat.unlit = true;
-                smat.cull_mode = None;
-                self.material_assets.add(smat)
-            })
-            .clone_weak()
-    }
-}
 
 fn generate_points(
     mut commands: Commands,
