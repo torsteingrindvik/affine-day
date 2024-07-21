@@ -8,8 +8,10 @@ impl Plugin for MaterialMeshCachePlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<TypeIdMeshCache>()
             .register_type::<UsizeMaterialCache>()
+            .register_type::<UsizeColorCache>()
             .init_resource::<TypeIdMeshCache>()
-            .init_resource::<UsizeMaterialCache>();
+            .init_resource::<UsizeMaterialCache>()
+            .init_resource::<UsizeColorCache>();
     }
 }
 
@@ -25,6 +27,12 @@ struct UsizeMaterialCache {
     cache: HashMap<usize, Handle<StandardMaterial>>,
 }
 
+#[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
+#[reflect(Resource)]
+struct UsizeColorCache {
+    cache: HashMap<usize, Color>,
+}
+
 #[derive(SystemParam)]
 pub struct MeshMaterialCache<'w> {
     mesh_assets: ResMut<'w, Assets<Mesh>>,
@@ -32,6 +40,8 @@ pub struct MeshMaterialCache<'w> {
 
     material_assets: ResMut<'w, Assets<StandardMaterial>>,
     material_cache: ResMut<'w, UsizeMaterialCache>,
+
+    color_cache: ResMut<'w, UsizeColorCache>,
 }
 
 impl<'w> MeshMaterialCache<'_> {
@@ -43,19 +53,38 @@ impl<'w> MeshMaterialCache<'_> {
             .clone_weak()
     }
 
+    fn material_color(&mut self, key: usize) -> (Handle<StandardMaterial>, Color) {
+        if let Some(mat) = self.material_cache.get(&key) {
+            let col = self.color_cache.get(&key).unwrap();
+
+            (mat.clone_weak(), *col)
+        } else {
+            let color = Color::srgb_from_array(rand::random());
+            self.color_cache.insert(key, color);
+            let mut smat: StandardMaterial = color.into();
+
+            smat.unlit = true;
+            smat.cull_mode = None;
+            let handle = self.material_assets.add(smat);
+            let weak = handle.clone_weak();
+            self.material_cache.insert(key, handle);
+
+            (weak, color)
+        }
+    }
+
     /// Weak handle to a material from a usize.
     /// Material is unlit and of random color.
+    ///
+    /// If key does not exist will insert both a material and its related color
+    /// into cache
     pub fn material(&mut self, key: usize) -> Handle<StandardMaterial> {
-        self.material_cache
-            .entry(key)
-            .or_insert_with(|| {
-                let color = Color::srgb_from_array(rand::random());
-                let mut smat: StandardMaterial = color.into();
+        self.material_color(key).0
+    }
 
-                smat.unlit = true;
-                smat.cull_mode = None;
-                self.material_assets.add(smat)
-            })
-            .clone_weak()
+    /// If key does not exist will insert both a material and its related color
+    /// into cache
+    pub fn color(&mut self, key: usize) -> Color {
+        self.material_color(key).1
     }
 }
