@@ -7,11 +7,11 @@ pub struct MaterialMeshCachePlugin;
 impl Plugin for MaterialMeshCachePlugin {
     fn build(&self, app: &mut App) {
         app.register_type::<TypeIdMeshCache>()
-            .register_type::<UsizeMaterialCache>()
-            .register_type::<UsizeColorCache>()
+            .register_type::<MaterialsCache>()
+            .register_type::<ColorCache>()
             .init_resource::<TypeIdMeshCache>()
-            .init_resource::<UsizeMaterialCache>()
-            .init_resource::<UsizeColorCache>();
+            .init_resource::<MaterialsCache>()
+            .init_resource::<ColorCache>();
     }
 }
 
@@ -23,14 +23,32 @@ struct TypeIdMeshCache {
 
 #[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
 #[reflect(Resource)]
-struct UsizeMaterialCache {
-    cache: HashMap<usize, Handle<StandardMaterial>>,
+struct MaterialsCache {
+    cache: HashMap<MaterialKey, Handle<StandardMaterial>>,
 }
 
 #[derive(Debug, Default, Resource, Deref, DerefMut, Reflect)]
 #[reflect(Resource)]
-struct UsizeColorCache {
-    cache: HashMap<usize, Color>,
+struct ColorCache {
+    cache: HashMap<MaterialKey, Color>,
+}
+
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Reflect, Clone, Copy)]
+pub enum MaterialKey {
+    Usize(usize),
+    LinearRgba([u8; 4]),
+}
+
+impl From<[u8; 4]> for MaterialKey {
+    fn from(v: [u8; 4]) -> Self {
+        Self::LinearRgba(v)
+    }
+}
+
+impl From<usize> for MaterialKey {
+    fn from(v: usize) -> Self {
+        Self::Usize(v)
+    }
 }
 
 #[derive(SystemParam)]
@@ -39,9 +57,9 @@ pub struct MeshMaterialCache<'w> {
     mesh_cache: ResMut<'w, TypeIdMeshCache>,
 
     material_assets: ResMut<'w, Assets<StandardMaterial>>,
-    material_cache: ResMut<'w, UsizeMaterialCache>,
+    material_cache: ResMut<'w, MaterialsCache>,
 
-    color_cache: ResMut<'w, UsizeColorCache>,
+    color_cache: ResMut<'w, ColorCache>,
 }
 
 impl<'w> MeshMaterialCache<'_> {
@@ -53,13 +71,18 @@ impl<'w> MeshMaterialCache<'_> {
             .clone_weak()
     }
 
-    fn material_color(&mut self, key: usize) -> (Handle<StandardMaterial>, Color) {
+    fn material_color(&mut self, key: MaterialKey) -> (Handle<StandardMaterial>, Color) {
         if let Some(mat) = self.material_cache.get(&key) {
             let col = self.color_cache.get(&key).unwrap();
 
             (mat.clone_weak(), *col)
         } else {
-            let color = Color::srgb_from_array(rand::random());
+            let color = match key {
+                MaterialKey::Usize(_) => Color::srgb_from_array(rand::random()),
+                MaterialKey::LinearRgba(color) => {
+                    Color::LinearRgba(LinearRgba::from_u8_array(color))
+                }
+            };
             self.color_cache.insert(key, color);
             let mut smat: StandardMaterial = color.into();
 
@@ -73,18 +96,11 @@ impl<'w> MeshMaterialCache<'_> {
         }
     }
 
-    /// Weak handle to a material from a usize.
-    /// Material is unlit and of random color.
-    ///
-    /// If key does not exist will insert both a material and its related color
-    /// into cache
-    pub fn material(&mut self, key: usize) -> Handle<StandardMaterial> {
-        self.material_color(key).0
+    pub fn material(&mut self, key: impl Into<MaterialKey>) -> Handle<StandardMaterial> {
+        self.material_color(key.into()).0
     }
 
-    /// If key does not exist will insert both a material and its related color
-    /// into cache
-    pub fn color(&mut self, key: usize) -> Color {
-        self.material_color(key).1
+    pub fn color(&mut self, key: impl Into<MaterialKey>) -> Color {
+        self.material_color(key.into()).1
     }
 }
